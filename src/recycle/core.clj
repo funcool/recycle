@@ -49,7 +49,8 @@
   [spec]
   (letfn [(factory [{:keys [::instances] :as options}]
             (let [options (dissoc options ::instances)]
-              (-> (assoc spec :options options :instances instances)
+              (-> (assoc spec :options options)
+                  (merge (when instances {:instances instances}))
                   (initialize-service))))]
     {::factory factory}))
 
@@ -101,18 +102,20 @@
    ::value value})
 
 (defn ask!
-  [{:keys [::inbox-ch ::timeout] :as service} & args]
-  (let [output (a/chan 1)
-        timeout (a/timeout timeout)
-        message [output args]]
-    (a/go
-      (let [[val port] (a/alts! [[inbox-ch message] timeout])]
-        (if (identical? port timeout)
+  ([service]
+   (ask! service nil))
+  ([{:keys [::inbox-ch ::timeout] :as service} msg]
+   (let [output (a/chan 1)
+         timeout (a/timeout timeout)
+         message [output msg]]
+     (a/go
+       (let [[val port] (a/alts! [[inbox-ch message] timeout])]
+         (if (identical? port timeout)
           (ex-info "put message to service timed out" {})
           (let [[val port] (a/alts! [output timeout])]
             (if (identical? port timeout)
               (ex-info "take message result from service timed out" {})
-              val)))))))
+              val))))))))
 
 (defn ask!!
   [service & args]
