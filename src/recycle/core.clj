@@ -51,8 +51,7 @@
             (let [options (dissoc options ::instances)]
               (-> (assoc spec :options options :instances instances)
                   (initialize-service))))]
-    {::spec spec
-     ::factory factory}))
+    {::factory factory}))
 
 (defn create
   "Create an instance of the provided service."
