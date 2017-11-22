@@ -80,10 +80,11 @@
 (declare initialize-loop)
 
 (defn start!
-  [{:keys [::status ::local ::init ::options] :as service}]
+  [{:keys [::status ::stop-ch ::local ::init ::options] :as service}]
   {:pre [(service? service)]}
   (when (compare-and-set! status ::stopped ::started)
     (vreset! local (init options))
+    (vreset! stop-ch (a/chan))
     (initialize-loop service)
     service))
 
@@ -91,8 +92,9 @@
   [{:keys [::status ::local ::stop-ch ::stop] :as service}]
   {:pre [(service? service)]}
   (when (compare-and-set! status ::started ::stopped)
-    (a/put! stop-ch true) ;; Notify the internal loop that the service is stoped
+    (a/close! @stop-ch) ;; Notify the internal loop that the service is stoped
     (stop @local)
+    (vreset! stop-ch nil)
     (vreset! local nil)))
 
 (defn with-state
@@ -145,12 +147,13 @@
         (a/close! out)))))
 
 (defn- initialize-loop
-  [{:keys [::inbox-ch ::stop-ch] :as service}]
-  (a/go-loop []
-    (let [[msg port] (a/alts! [stop-ch inbox-ch] :priority true)]
-      (when (identical? port inbox-ch)
-        (a/<! (handle-message service msg))
-        (recur)))))
+  [{:keys [::inbox-ch ::stop-ch ::instances] :as service}]
+  (dotimes [i instances]
+    (a/go-loop []
+      (let [[msg port] (a/alts! [@stop-ch inbox-ch] :priority true)]
+        (when (identical? port inbox-ch)
+          (a/<! (handle-message service msg))
+          (recur))))))
 
 (defn- initialize-service
   [{:keys [init stop error receive buf-or-n timeout options instances]
@@ -162,7 +165,7 @@
          receive default-receive}
     :as spec}]
   (let [inbox-ch (a/chan (if (integer? buf-or-n) buf-or-n (buf-or-n)))
-        stop-ch (a/chan 1)
+        stop-ch (volatile! nil)
         timeout (or timeout *timeout* 60000)
         status (atom ::stopped)
         local (volatile! nil)]
