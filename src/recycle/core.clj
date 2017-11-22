@@ -34,14 +34,11 @@
   The spec map may contain any of the following keys (all of the are
   optional):
 
-   - `:init`:       initialization hook, receives the service spec and optionally some
-                    config parameter and it should return the internal state instance;
-                    this parameter is optional.
+   - `:init`:       initialization hook, receives the options object passed to start
+                    function; it should create and return the local state of the service;
+                    (this attr is optional)
    - `:stop`:       termination hook, receives the service spec, internal state and
                     allows proper resource clearing; this parameter is optional.
-   - `:error`:      error hook, receives the service spec, internal state and the
-                    exception instance; it should handle it or just return the exception
-                    instance as is; this parameter is optional.
    - `:receive`:    function that receives the internal state and variable number of args
                     identifying the message sent to the service.
    - `:timeout`:    default maximum number of milliseconds to wait for a response
