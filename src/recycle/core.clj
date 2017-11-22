@@ -127,8 +127,8 @@
 ;; --- Implementation
 
 (defn- handle-message
-  [{:keys [::receive ::local]} [out args]]
-  (a/go-loop [result (u/try-on (apply receive @local args))]
+  [{:keys [::receive ::local]} [out msg]]
+  (a/go-loop [result (u/try-on (receive @local msg))]
     (cond
       (u/chan? result)
       (recur (a/<! result))
@@ -149,9 +149,9 @@
   [{:keys [::inbox-ch ::stop-ch ::instances] :as service}]
   (dotimes [i instances]
     (a/go-loop []
-      (let [[msg port] (a/alts! [@stop-ch inbox-ch] :priority true)]
+      (let [[message port] (a/alts! [@stop-ch inbox-ch] :priority true)]
         (when (identical? port inbox-ch)
-          (a/<! (handle-message service msg))
+          (a/<! (handle-message service message))
           (recur))))))
 
 (defn- initialize-service

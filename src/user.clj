@@ -27,13 +27,13 @@
 ;; Asychronous counter service
 (def counter-service
   (r/service {:init (constantly 0)
-             :receive (fn [counter & args]
+             :receive (fn [counter message]
                          (a/go
-                           (a/<! (a/timeout 100)) ;; simulate some async work
+                           (a/<! (a/timeout 10)) ;; simulate some async work
                            (r/with-state counter (inc counter))))}))
 
-(def adder-service (r/service {:receive (fn [_ & args] (apply + args))}))
-(def greeter-service (r/service {:receive (fn [_ & [name]] (str "Hello " name))}))
+(def adder-service (r/service {:receive (fn [_ nums] (apply + nums))}))
+(def greeter-service (r/service {:receive (fn [_ name] (str "Hello " name))}))
 
 ;; Hierarchical service
 (def hierarchical-service
@@ -51,14 +51,14 @@
             (r/stop! hello))
 
     ;; Service on message hook
-    :receive (fn [{:keys [adder hello] :as local} & [name & rest]]
+    :receive (fn [{:keys [adder hello] :as local} & [name rest]]
                (a/go
                  (case name
-                   :add (a/<! (apply r/ask! adder rest))
-                   :greets (a/<! (apply r/ask! hello rest)))))}))
+                   :add (a/<! (r/ask! adder rest))
+                   :greets (a/<! (r/ask! hello rest)))))}))
 
-(def service-a (r/create counter-service {::r/instances 2}))
-(def service-b (r/create hierarchical-service {::r/instances 1}))
+(def service-a (r/create counter-service))
+(def service-b (r/create hierarchical-service))
 
 (r/start! service-a)
 (r/start! service-b)
