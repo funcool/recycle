@@ -1,16 +1,17 @@
 (ns user
-  (:refer-clojure :exclude [test])
-  (:require [clojure.tools.namespace.repl :as nsrepl]
+  (:require [clojure.tools.namespace.repl :as repl]
             [clojure.walk :refer [macroexpand-all]]
             [clojure.pprint :refer [pprint]]
-            [clojure.test :as test]))
+            [clojure.test :as test]
+            [clojure.core.async :as a]
+            [recycle.core :as r]))
 
 ;; --- Development Stuff
 
-(defn test
+(defn run-tests
   ([] (test #"^recycle.tests.*"))
   ([o]
-   (nsrepl/refresh)
+   (repl/refresh)
    (cond
      (instance? java.util.regex.Pattern o)
      (test/run-all-tests o)
@@ -20,3 +21,46 @@
        (do (require (symbol sns))
            (test/test-vars [(resolve o)]))
        (test/test-ns o)))))
+
+;; --- Experiments Code
+
+;; Asychronous counter service
+(def counter-service
+  (r/service {:init (constantly 0)
+             :receive (fn [counter & args]
+                         (a/go
+                           (a/<! (a/timeout 100)) ;; simulate some async work
+                           (r/with-state counter (inc counter))))}))
+
+(def adder-service (r/service {:receive (fn [_ & args] (apply + args))}))
+(def greeter-service (r/service {:receive (fn [_ & [name]] (str "Hello " name))}))
+
+;; Hierarchical service
+(def hierarchical-service
+  (r/service
+   ;; Service initialization
+   {:init (fn [options]
+            (let [adder (r/create adder-service)
+                  hello (r/create greeter-service)]
+              {:adder (r/start! adder)
+               :hello (r/start! hello)}))
+
+    ;; Service resource cleaining
+    :stop (fn [{:keys [adder hello] :as local}]
+            (r/stop! adder)
+            (r/stop! hello))
+
+    ;; Service on message hook
+    :receive (fn [{:keys [adder hello] :as local} & [name & rest]]
+               (a/go
+                 (case name
+                   :add (a/<! (apply r/ask! adder rest))
+                   :greets (a/<! (apply r/ask! hello rest)))))}))
+
+(def service-a (r/create counter-service {::r/instances 2}))
+(def service-b (r/create hierarchical-service {::r/instances 1}))
+
+(r/start! service-a)
+(r/start! service-b)
+;; (r/stop! service)
+

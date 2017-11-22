@@ -1,21 +1,19 @@
 (ns recycle.core
-  (:refer-clojure :exclude [send key])
-  (:require [clojure.core.async :as a :refer [>! >!! <! <!! go go-loop thread timeout]]
-            [clojure.tools.logging :as log]
-            [try.core :as try]
-            [recycle.util :as util]))
+  (:require [clojure.core.async :as a]
+            [recycle.util :as u]))
 
-(defn- start-service
-  [service config]
-  (try/try> ((:start service) ((:map-config service) config))))
+;; --- Helpers
 
-(defn- stop-service
-  [service instance]
-  (try/try> ((:stop service) instance)))
 
-(defn- receive-service
-  [service instance args]
-  (try/try> (apply (:receive service) instance args)))
+(defn service?
+  [v]
+  (::service v))
+
+(defn service-factory?
+  [v]
+  (::factory v))
+
+;; --- Main API
 
 (def ^:dynamic *timeout*
   "Maximum number of milliseconds to wait for a response from a
@@ -23,180 +21,162 @@
   when creating the service is used."
   nil)
 
+(defn- default-receive
+  "A default implementation for `:receive`."
+  [& _]
+  (ex-info "service do not implement :receive" {}))
+
+(declare initialize-service)
+(declare start!)
+
 (defn service
   "Create a service using the spec map as a blueprint.
   The spec map may contain any of the following keys (all of the are
   optional):
 
-  :key  - keyword that identifies the service
-
-  :map-config - function that modifies the config arg that is supplied
-  to the :start function when starting the service.
-
-  :start - function that receives a config arg, starts the service,
-  and returns its instance. By default a function that ignores the
-  config arg and returns nil is used.
-
-  :stop - function that receives the instance of the service and stops
-  it. By default a function that ignores the instance arg and returns
-  nil is used.
-
-  :receive - function that receives the instance of the service, a
-  variable number of args identifying the message sent to the service,
-  and that dispatches the action corresponding to that message.
-
-  :timeout - maximum number of milliseconds to wait for a response
-  from the service. It can be overriden also with the special variable
-  *timeout*. By default is 1 minute.
-
-  :buf-or-n - core.async buffer or size of buffer to use for the
-  service communication channel. By default is 1024."
+   - `:init`:       initialization hook, receives the service spec and optionally some
+                    config parameter and it should return the internal state instance;
+                    this parameter is optional.
+   - `:stop`:       termination hook, receives the service spec, internal state and
+                    allows proper resource clearing; this parameter is optional.
+   - `:error`:      error hook, receives the service spec, internal state and the
+                    exception instance; it should handle it or just return the exception
+                    instance as is; this parameter is optional.
+   - `:receive`:    function that receives the internal state and variable number of args
+                    identifying the message sent to the service.
+   - `:timeout`:    default maximum number of milliseconds to wait for a response
+                    from the service (default 1min).
+   - `:buf-or-n`:   core.async buffer or size of buffer to use for the
+                    service communication channel (default 1024).
+  "
   [spec]
-  (let [spec         (or spec {})
-        key          (or (:key spec)
-                         (keyword (gensym "service-")))
-        service      {:start      (or (:start spec) util/noop)
-                      :stop       (or (:stop spec) util/noop)
-                      :receive    (or (:receive spec)
-                                      (util/throwing (ex-info "service do not implement :receive"
-                                                              {:service key})))
-                      :map-config (or (:map-config spec) identity)}
-        timeout      (or *timeout* (:timeout spec) 60000)
-        buf-or-n     (or (:buf-or-n spec) 1024)
-        in           (a/chan buf-or-n)
-        state        (volatile! [:stopped nil])
-        instance     #(second @state)
-        status       #(first @state)
-        set-started! #(vreset! state [:started %])
-        set-stopped! #(vreset! state [:stopped %])
-        stopped?     #(= :stopped (status))
-        started?     #(= :started (status))]
-    (go-loop [msg (<! in)]
-      (try
-        (let [[out cmd args] msg
-              result         (condp = cmd
-                               ::start   (if (stopped?)
-                                           (try/map #(set-started! %)
-                                                    (start-service service args))
-                                           (try/succeed (instance)))
-                               ::stop    (if (started?)
-                                           (try/map #(set-stopped! %)
-                                                    (stop-service service (instance)))
-                                           (try/succeed (instance)))
-                               ::receive (if (started?)
-                                           (receive-service service (instance) args)
-                                           (try/fail (ex-info "called a service that isn't running" {:key  key
-                                                                                                     :args args}))))]
-          (go (>! out result)))
-        (catch Exception e
-          (log/warnf "unrecognized message received by service %s %s" key msg)))
-      (recur (<! in)))
-    (letfn [(send-message [cmd & [args]]
-              (go (let [out          (a/chan)
-                        msg          [out cmd args]
-                        [put-res _]  (a/alts! [(go (>! in msg))
-                                               (a/timeout timeout)])
-                        [take-res _] (when put-res
-                                       (a/alts! [(go (<! out))
-                                                 (a/timeout timeout)]))]
-                    (a/close! out)
-                    (cond
-                      (nil? put-res)
-                      (try/fail (ex-info "put message to service timed out" {:service key
-                                                                             :message msg}))
+  (letfn [(factory [{:keys [::instances] :as options}]
+            (let [options (dissoc options ::instances)]
+              (-> (assoc spec :options options :instances instances)
+                  (initialize-service))))]
+    {::spec spec
+     ::factory factory}))
 
-                      (nil? take-res)
-                      (try/fail (ex-info "take message result from service timed out" {:service key
-                                                                                       :message msg}))
-
-                      :else
-                      take-res))))]
-      {::key      key
-       ::start    (fn [config]
-                    (send-message ::start config))
-       ::started? started?
-       ::stop     (fn []
-                    (send-message ::stop))
-       ::stopped? stopped?
-       ::receive  (fn [args]
-                    (send-message ::receive args))})))
-
-(defn key
-  "Returns the key that identifies service."
-  [service]
-  (::key service))
-
-(defn start
-  "Starts service using config as the configuration. If service cannot
-  start throws an ex-info. Returns nil."
-  [service config]
-  @(<!! ((::start service) config))
-  nil)
-
-(defn stop
-  "Stops service. If service cannot stop throws an ex-info. Returns
-  nil."
-  [service]
-  @(<!! ((::stop service))))
+(defn create
+  "Create an instance of the provided service."
+  ([sf]
+   (create sf nil))
+  ([sf options]
+   {:pre [(service-factory? sf)]}
+   ((::factory sf) options)))
 
 (defn started?
   "Check if service is started. Returns true if it is, false if it's not."
-  [service]
-  ((::started? service)))
+  [{:keys [::status] :as service}]
+  {:pre [(service? service)]}
+  (= @status ::started))
 
 (defn stopped?
   "Check if service is stopped. Returns true if it is, false if it's not."
-  [service]
-  ((::stopped? service)))
+  [{:keys [::status] :as service}]
+  {:pre [(service? service)]}
+  (= @status ::stopped))
 
-(defn ask
-  "Send args to service and return the result the service has for that invocation."
+(declare initialize-loop)
+
+(defn start!
+  [{:keys [::status ::local ::init ::options] :as service}]
+  {:pre [(service? service)]}
+  (when (compare-and-set! status ::stopped ::started)
+    (vreset! local (init options))
+    (initialize-loop service)
+    service))
+
+(defn stop!
+  [{:keys [::status ::local ::stop-ch ::stop] :as service}]
+  {:pre [(service? service)]}
+  (when (compare-and-set! status ::started ::stopped)
+    (a/put! stop-ch true) ;; Notify the internal loop that the service is stoped
+    (stop @local)
+    (vreset! local nil)))
+
+(defn with-state
+  "A function that allows return a value attached to new local state."
+  [value state]
+  {::with-state true
+   ::local state
+   ::value value})
+
+(defn ask!
+  [{:keys [::inbox-ch ::timeout] :as service} & args]
+  (let [output (a/chan 1)
+        timeout (a/timeout timeout)
+        message [output args]]
+    (a/go
+      (let [[val port] (a/alts! [[inbox-ch message] timeout])]
+        (if (identical? port timeout)
+          (ex-info "put message to service timed out" {})
+          (let [[val port] (a/alts! [output timeout])]
+            (if (identical? port timeout)
+              (ex-info "take message result from service timed out" {})
+              val)))))))
+
+(defn ask!!
   [service & args]
-  @(<!! ((::receive service) args)))
+  (let [result (a/<!! (apply ask! service args))]
+    (if (instance? Throwable result)
+      (throw result)
+      result)))
 
-(defn ?
-  "Alias for ask. Send args to service and return the result the service
-  has for that invocation."
-  [service & args]
-  (apply ask service args))
+;; --- Implementation
 
-(defn service-map
-  "Create a service using the spec map as a blueprint.
-  The spec map is a map of keywords identifying services to service-specs.
-  Returns a service that will:
-  - start (in any order) each service in the map when started
+(defn- handle-message
+  [{:keys [::receive ::local]} [out args]]
+  (a/go-loop [result (u/try-on (apply receive @local args))]
+    (cond
+      (u/chan? result)
+      (recur (a/<! result))
 
-  - stop (in any order) each service in the map when stopped
+      (and (map? result)
+           (::with-state result))
+      (do
+        (vreset! local (::local result))
+        (a/>! out (::value result))
+        (a/close! out))
 
-  - route messages to each service when asked, the first arg in ask
-  identifies the service key in the map and the rest are used to ask
-  the service"
-  [spec]
-  (let [spec                 (or spec {})
-        key                  (or (:key spec)
-                                 (keyword (gensym "service-map-")))
-        map-config           (or (:map-config spec)
-                                 identity)
-        start-system-service (fn [spec config]
-                               (let [s (service spec)]
-                                 (start s (map-config config))
-                                 s))
-        concurrently (fn [f]
-                       (<!!
-                         (a/into
-                           {}
-                           (a/merge
-                             (map (fn [[key service]]
-                                    (go [key (f service)])) spec)))))]
-    (service {:key key
-              :start (fn [config]
-                       (concurrently #(start-system-service % config)))
-              :stop (fn [instance]
-                      (concurrently #(stop %)))
-              :receive (fn [instance service-key & args]
-                         (let [service (instance service-key)]
-                           (if (nil? service)
-                             (throw (ex-info "message sent to service not found in map"
-                                             {:key     key
-                                              :service service-key}))
-                             (apply ask service args))))})))
+      :else
+      (do
+        (a/>! out result)
+        (a/close! out)))))
+
+(defn- initialize-loop
+  [{:keys [::inbox-ch ::stop-ch] :as service}]
+  (a/go-loop []
+    (let [[msg port] (a/alts! [stop-ch inbox-ch] :priority true)]
+      (when (identical? port inbox-ch)
+        (a/<! (handle-message service msg))
+        (recur)))))
+
+(defn- initialize-service
+  [{:keys [init stop error receive buf-or-n timeout options instances]
+    :or {init u/noop
+         stop u/noop
+         error identity
+         buf-or-n 1024
+         instances 1
+         receive default-receive}
+    :as spec}]
+  (let [inbox-ch (a/chan (if (integer? buf-or-n) buf-or-n (buf-or-n)))
+        stop-ch (a/chan 1)
+        timeout (or timeout *timeout* 60000)
+        status (atom ::stopped)
+        local (volatile! nil)]
+    {::service true
+     ::instances instances
+     ::options options
+     ::buf-or-n buf-or-n
+     ::init init
+     ::stop stop
+     ::receive receive
+     ::inbox-ch inbox-ch
+     ::stop-ch stop-ch
+     ::timeout timeout
+     ::status status
+     ::local local}))
+
+
