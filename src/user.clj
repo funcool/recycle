@@ -27,7 +27,7 @@
 ;; Asychronous counter service
 (def counter-service
   (r/service {:init (constantly 0)
-             :receive (fn [counter message]
+              :receive (fn [counter message]
                          (a/go
                            (a/<! (a/timeout 10)) ;; simulate some async work
                            (r/with-state counter (inc counter))))}))
